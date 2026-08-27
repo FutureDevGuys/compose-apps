@@ -7,6 +7,6 @@ Use a versioned `portable-vX.Y.Z` release. Download the tar or zip bundle plus `
 - [Artifact verification](VERIFICATION.md)
 - [Release workflow policy](WORKFLOW-POLICY.md)
 - [Security policy](SECURITY.md)
-- [Machine-readable release catalog](releases.json)
+- [Versioned releases](https://github.com/FutureDevGuys/compose-apps/releases)
 
 Portable bundles contain no homelab hostnames, private networks, provider metadata, encrypted inputs, real credentials, external homelab networks, or files outside the archive. Each supported application runs through ordinary Docker Compose from its extracted directory.

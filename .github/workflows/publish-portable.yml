@@ -1,0 +1,154 @@
+name: publish-portable
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Signed FutureDevGuys/homelab tag (portable-vX.Y.Z)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: portable-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'FutureDevGuys/compose-apps' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate immutable release identity
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = main
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" = "$GITHUB_SHA"
+          [[ "$SOURCE_TAG" =~ ^portable-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          if gh release view "$SOURCE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release already exists: $SOURCE_TAG" >&2
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$SOURCE_TAG" >/dev/null 2>&1; then
+            echo "release tag already exists: $SOURCE_TAG" >&2
+            exit 1
+          fi
+          echo "version=${SOURCE_TAG#portable-}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint source-read token
+        id: source-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.HOMELAB_SOURCE_APP_ID }}
+          private-key: ${{ secrets.HOMELAB_SOURCE_APP_PRIVATE_KEY }}
+          owner: FutureDevGuys
+          repositories: homelab
+          permission-contents: read
+
+      - name: Verify signed source tag
+        id: source
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          ref="$(gh api "repos/FutureDevGuys/homelab/git/ref/tags/$SOURCE_TAG")"
+          test "$(jq -r '.object.type' <<<"$ref")" = tag
+          tag_object="$(jq -r '.object.sha' <<<"$ref")"
+          tag="$(gh api "repos/FutureDevGuys/homelab/git/tags/$tag_object")"
+          test "$(jq -r '.tag' <<<"$tag")" = "$SOURCE_TAG"
+          test "$(jq -r '.verification.verified' <<<"$tag")" = true
+          test "$(jq -r '.object.type' <<<"$tag")" = commit
+          commit="$(jq -r '.object.sha' <<<"$tag")"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact portable source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: FutureDevGuys/homelab
+          ref: ${{ inputs.source_tag }}
+          token: ${{ steps.source-token.outputs.token }}
+          persist-credentials: false
+          path: source
+          sparse-checkout: |
+            portable
+            scripts/export_portable.py
+
+      - name: Prove checkout and deterministic artifacts
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          python3 source/scripts/export_portable.py \
+            --version "$VERSION" \
+            --output dist
+          python3 source/scripts/export_portable.py \
+            --version "$VERSION" \
+            --output dist-repeat
+          diff -qr dist dist-repeat
+          (cd dist && sha256sum --check SHA256SUMS)
+
+      - name: Validate clean archive extractions
+        env:
+          VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir extract-tar extract-zip
+          tar -xzf "dist/compose-apps-$VERSION.tar.gz" -C extract-tar
+          unzip -q "dist/compose-apps-$VERSION.zip" -d extract-zip
+          for extraction in extract-tar extract-zip; do
+            count=0
+            for app in "$extraction/compose-apps-$VERSION"/apps/*; do
+              test -f "$app/compose.yaml"
+              test -f "$app/compose.local.yaml"
+              docker compose \
+                --project-directory "$app" \
+                -f "$app/compose.yaml" \
+                -f "$app/compose.local.yaml" \
+                config >/dev/null
+              count=$((count + 1))
+            done
+            test "$count" -gt 0
+          done
+
+      - name: Attest every release asset
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/*
+
+      - name: Publish only after independent download equality
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          gh release create "$SOURCE_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --draft \
+            --title "$SOURCE_TAG" \
+            --notes "Portable artifacts from signed FutureDevGuys/homelab@$SOURCE_TAG ($SOURCE_COMMIT)."
+          mkdir downloaded
+          gh release download "$SOURCE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir downloaded
+          diff -qr dist downloaded
+          gh release edit "$SOURCE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest=false
