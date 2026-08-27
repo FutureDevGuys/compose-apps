@@ -83,8 +83,9 @@ jobs:
           persist-credentials: false
           path: source
           sparse-checkout: |
-            portable
-            scripts/export_portable.py
+            /portable/
+            /scripts/export_portable.py
+          sparse-checkout-cone-mode: false
 
       - name: Prove checkout and deterministic artifacts
         env:

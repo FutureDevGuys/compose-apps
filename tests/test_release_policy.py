@@ -22,6 +22,7 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertIn("object.type' <<<\"$ref\")\" = tag", text)
         self.assertIn("persist-credentials: false", text)
         self.assertIn("sparse-checkout:", text)
+        self.assertIn("sparse-checkout-cone-mode: false", text)
         self.assertNotIn("--source-commit", text)
         self.assertIn("diff -qr dist dist-repeat", text)
         self.assertIn("actions/attest@", text)
