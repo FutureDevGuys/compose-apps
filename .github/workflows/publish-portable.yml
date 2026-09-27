@@ -1,0 +1,181 @@
+name: Publish portable release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Public semantic version, for example v1.0.0
+        required: true
+        type: string
+      source_commit:
+        description: Exact 40-character homelab commit named by the signed portable tag
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: portable-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact shelf workflow commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate dispatch and current shelf source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_REF" = refs/heads/main
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          current="$(gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)"
+          test "$current" = "$GITHUB_SHA"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION" >/dev/null 2>&1; then
+            echo 'Public version tag is already reserved' >&2
+            exit 1
+          fi
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'Public release already exists' >&2
+            exit 1
+          fi
+
+      - name: Mint read-only token for exact private source repository
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.HOMELAB_SOURCE_APP_ID }}
+          private-key: ${{ secrets.HOMELAB_SOURCE_APP_PRIVATE_KEY }}
+          owner: FutureDevGuys
+          repositories: homelab
+          permission-contents: read
+
+      - name: Verify signed annotated source tag through GitHub
+        id: source-tag
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          tag="portable-$VERSION"
+          ref="$(gh api "repos/FutureDevGuys/homelab/git/ref/tags/$tag")"
+          test "$(jq -r '.object.type' <<<"$ref")" = tag
+          tag_oid="$(jq -r '.object.sha' <<<"$ref")"
+          object="$(gh api "repos/FutureDevGuys/homelab/git/tags/$tag_oid")"
+          test "$(jq -r '.verification.verified' <<<"$object")" = true
+          test "$(jq -r '.object.type' <<<"$object")" = commit
+          test "$(jq -r '.object.sha' <<<"$object")" = "$SOURCE_COMMIT"
+          echo "tag_oid=$tag_oid" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact tagged portable source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: FutureDevGuys/homelab
+          token: ${{ steps.source-token.outputs.token }}
+          ref: portable-${{ inputs.version }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: source
+          submodules: false
+          lfs: false
+          filter: blob:none
+          sparse-checkout: |
+            portable
+            scripts/export_portable.py
+          sparse-checkout-cone-mode: false
+
+      - name: Build deterministic portable artifacts
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          python3 source/scripts/export_portable.py --version "$VERSION" --output dist
+          (cd dist && sha256sum --check SHA256SUMS)
+          python3 scripts/verify_release.py --artifact-dir dist --version "$VERSION" --source-commit "$SOURCE_COMMIT"
+
+      - name: Attest exact release artifacts
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - name: Verify exact workflow provenance before draft creation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for path in dist/*; do
+            gh attestation verify "$path" --repo "$GITHUB_REPOSITORY" \
+              --signer-repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-portable.yml" \
+              --signer-digest "$GITHUB_SHA" --source-digest "$GITHUB_SHA" >/dev/null
+          done
+
+      - name: Create and verify draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          gh release create "$VERSION" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft \
+            --title "compose-apps $VERSION" --notes "Portable Compose artifacts from signed homelab tag portable-$VERSION."
+          mkdir -m 700 downloaded
+          gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --dir downloaded
+          for path in dist/*; do
+            cmp "$path" "downloaded/${path##*/}"
+          done
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$VERSION" > release.json
+          python3 scripts/verify_release.py --artifact-dir dist --version "$VERSION" --source-commit "$SOURCE_COMMIT" --release-json release.json \
+            --expected-commit "$GITHUB_SHA" --expect-draft
+
+      - name: Recheck authorities and publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
+          SOURCE_TAG_OID: ${{ steps.source-tag.outputs.tag_oid }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)" = "$GITHUB_SHA"
+          tag="portable-$VERSION"
+          ref="$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/FutureDevGuys/homelab/git/ref/tags/$tag")"
+          test "$(jq -r '.object.type' <<<"$ref")" = tag
+          test "$(jq -r '.object.sha' <<<"$ref")" = "$SOURCE_TAG_OID"
+          object="$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/FutureDevGuys/homelab/git/tags/$(jq -r '.object.sha' <<<"$ref")")"
+          test "$(jq -r '.verification.verified' <<<"$object")" = true
+          test "$(jq -r '.object.sha' <<<"$object")" = "$SOURCE_COMMIT"
+          gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$VERSION" > release.json
+          python3 scripts/verify_release.py --artifact-dir dist --version "$VERSION" --source-commit "$SOURCE_COMMIT" --release-json release.json \
+            --expected-commit "$GITHUB_SHA" --expect-published-immutable
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION" --jq .object.sha)" = "$GITHUB_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)" = "$GITHUB_SHA"
+          ref="$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/FutureDevGuys/homelab/git/ref/tags/$tag")"
+          test "$(jq -r '.object.sha' <<<"$ref")" = "$SOURCE_TAG_OID"
+          mkdir -m 700 published-download
+          gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --dir published-download
+          for path in dist/*; do
+            cmp "$path" "published-download/${path##*/}"
+            gh attestation verify "$path" --repo "$GITHUB_REPOSITORY" \
+              --signer-repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-portable.yml" \
+              --signer-digest "$GITHUB_SHA" --source-digest "$GITHUB_SHA" >/dev/null
+          done

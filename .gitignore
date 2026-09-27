@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+dist/
+downloaded/
+published-download/
+release.json
