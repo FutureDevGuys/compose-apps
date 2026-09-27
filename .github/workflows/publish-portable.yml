@@ -115,6 +115,18 @@ jobs:
         with:
           subject-path: dist/*
 
+      - name: Verify exact workflow provenance before draft creation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for path in dist/*; do
+            gh attestation verify "$path" --repo "$GITHUB_REPOSITORY" \
+              --signer-repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-portable.yml" \
+              --signer-digest "$GITHUB_SHA" --source-digest "$GITHUB_SHA" >/dev/null
+          done
+
       - name: Create and verify draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -162,5 +174,8 @@ jobs:
           gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --dir published-download
           for path in dist/*; do
             cmp "$path" "published-download/${path##*/}"
-            gh attestation verify "$path" --repo "$GITHUB_REPOSITORY" >/dev/null
+            gh attestation verify "$path" --repo "$GITHUB_REPOSITORY" \
+              --signer-repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-portable.yml" \
+              --signer-digest "$GITHUB_SHA" --source-digest "$GITHUB_SHA" >/dev/null
           done
